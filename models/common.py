@@ -71,15 +71,17 @@ def autopad(k, p=None, d=1):
     return p
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 class WinogradConv2D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
         super(WinogradConv2D, self).__init__()
 
-        assert kernel_size == 3, "Only 3x3 Winograd supported"
+        assert kernel_size == 3, "Only 3x3 supported for Winograd"
         assert stride == 1, "Stride must be 1 for Winograd"
 
-        # Required for YOLOv5 layer fusion and tracing
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = (3, 3)
@@ -92,24 +94,25 @@ class WinogradConv2D(nn.Module):
         self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
 
     def forward(self, x):
-        B, C, H, W = x.shape
-        assert C == self.in_channels, "Input channel mismatch"
+        B, C_in, H, W = x.shape
+        assert C_in == self.in_channels, "Input channel mismatch"
 
-        # Step 1: Pad height and width to be divisible by 2
+        # Step 1: Pad input to make H, W divisible by 2
         pad_h = (2 - H % 2) % 2
         pad_w = (2 - W % 2) % 2
-        x = F.pad(x, (0, pad_w, 0, pad_h))  # pad right, bottom
+        x = F.pad(x, (0, pad_w, 0, pad_h))  # right, bottom
+        H_padded, W_padded = x.shape[2:]
 
-        # Step 2: Unfold into 4x4 tiles for Winograd (F(2x2,3x3))
-        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # (B, C, nH, nW, 4, 4)
-        assert tiles.shape[-1] == 4 and tiles.shape[-2] == 4, "Tile shape mismatch"
+        # Step 2: Extract 4x4 tiles (F(2x2,3x3) needs 4x4)
+        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # [B, C, nH, nW, 4, 4]
+        B, C_in, nH, nW, _, _ = tiles.shape
 
         # Step 3: Winograd transform matrices
         Bt = torch.tensor([
             [1, 0, -1, 0],
-            [0, 1,  1, 0],
+            [0, 1, 1, 0],
             [0, -1, 1, 0],
-            [0, 1,  0, -1]
+            [0, 1, 0, -1]
         ], dtype=x.dtype, device=x.device)
 
         G = torch.tensor([
@@ -124,46 +127,44 @@ class WinogradConv2D(nn.Module):
             [0, 1, -1, -1]
         ], dtype=x.dtype, device=x.device)
 
-        # Step 4: Transform the kernel
+        # Step 4: Transform kernel to Winograd domain
+        # self.weight: [out_channels, in_channels, 3, 3]
         Gg = torch.einsum('ij,oick->ojck', G, self.weight)
-        GgG = torch.einsum('ojck,kl->ojcl', Gg, G.T)  # (out, in, 4, 4)
+        U = torch.einsum('ojck,kl->ojcl', Gg, G.T)  # [out_channels, in_channels, 4, 4]
 
         # Step 5: Transform input tiles
-        V = torch.einsum('ij,bcnhwjk->bcnhwik', Bt, tiles)       # B C nH nW 4 4
-        V = torch.einsum('bcnhwik,kl->bcnhwil', V, Bt.T)
+        V = torch.einsum('ij,bcnhwjk->bcnhwik', Bt, tiles)  # (B, C, nH, nW, 4, 4)
+        V = torch.einsum('bcnhwik,kl->bcnhwil', V, Bt.T)    # (B, C, nH, nW, 4, 4)
 
-        # Step 6: Element-wise multiply in Winograd domain
-        # Align dimensions: [B, C, nH, nW, 4, 4] @ [1, C, out, 4, 4]
-        U = GgG.unsqueeze(0).transpose(1, 2)  # (1, out, in, 4, 4)
-        M = torch.einsum('bcnhij,iojkl->bconhlk', V, U)  # Result shape: B, out, nH, nW, 4, 4
+        # Step 6: Elementwise multiplication in Winograd domain
+        # V: [B, C_in, nH, nW, 4, 4], U: [out, C_in, 4, 4]
+        M = torch.einsum('bcnhij,ocij->bonh', V, U)  # [B, out, nH, nW]
 
-        # Step 7: Inverse transform output
-        Y = torch.einsum('ij,bconhjk->bconhik', At, M)
-        Y = torch.einsum('bconhik,kl->bconhil', Y, At.T)
+        # Step 7: Transform back to spatial domain (inverse)
+        M = M.view(B, self.out_channels, nH, nW, 4, 4)
+        Y = torch.einsum('ij,bcnhjk->bcnhik', At, M)
+        Y = torch.einsum('bcnhik,kl->bcnhil', Y, At.T)  # [B, out, nH, nW, 2, 2]
 
-        # Step 8: Extract only the 2x2 output per tile
-        Y = Y[:, :, :, :, :2, :2]  # (B, out, nH, nW, 2, 2)
+        # Step 8: Reconstruct full image
+        Y = Y[:, :, :, :, :2, :2]  # ensure only 2x2 output
+        Y = Y.permute(0, 1, 2, 4, 3, 5).contiguous()
+        Y = Y.view(B, self.out_channels, nH * 2, nW * 2)  # [B, out, H, W]
 
-        # Step 9: Stitch tiles back into full image
-        nH, nW = Y.shape[2], Y.shape[3]
-        Y = Y.permute(0, 1, 2, 4, 3, 5).contiguous()  # B, out, nH, 2, nW, 2
-        Y = Y.view(B, self.out_channels, nH * 2, nW * 2)
-
-        # Step 10: Crop extra padding if any
+        # Step 9: Crop back to original input size
         Y = Y[:, :, :H, :W]
 
-        # Step 11: Add bias
+        # Step 10: Add bias
         if self.bias is not None:
             Y += self.bias.view(1, -1, 1, 1)
 
         return Y
-
 
     def fuseforward(self, x):
         return self.forward(x)
 
     def fuse(self):
         return self
+
 
 
 class Conv(nn.Module):
