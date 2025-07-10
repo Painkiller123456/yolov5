@@ -95,62 +95,69 @@ class WinogradConv2D(nn.Module):
         B, C, H, W = x.shape
         assert C == self.in_channels, "Input channel mismatch"
 
-        # Pad to ensure divisibility by 2
-        if H % 2 != 0 or W % 2 != 0:
-            x = F.pad(x, (0, W % 2, 0, H % 2))  # pad right, bottom
+        # Step 1: Pad height and width to be divisible by 2
+        pad_h = (2 - H % 2) % 2
+        pad_w = (2 - W % 2) % 2
+        x = F.pad(x, (0, pad_w, 0, pad_h))  # pad right, bottom
 
-        # Extract 4x4 tiles (Winograd F(2x2,3x3) needs 4x4 region for 2x2 output)
-        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # shape: (B, C, nH, nW, 4, 4)
+        # Step 2: Unfold into 4x4 tiles for Winograd (F(2x2,3x3))
+        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # (B, C, nH, nW, 4, 4)
+        assert tiles.shape[-1] == 4 and tiles.shape[-2] == 4, "Tile shape mismatch"
 
-        # Transform matrices from Lavin's paper (Winograd minimal filtering)
-        # B.T @ d @ B
+        # Step 3: Winograd transform matrices
         Bt = torch.tensor([
-            [1,  0, -1,  0],
-            [0,  1,  1,  0],
-            [0, -1,  1,  0],
-            [0,  1,  0, -1]
+            [1, 0, -1, 0],
+            [0, 1,  1, 0],
+            [0, -1, 1, 0],
+            [0, 1,  0, -1]
         ], dtype=x.dtype, device=x.device)
 
-        # G @ g @ G.T
         G = torch.tensor([
-            [1,     0,     0],
-            [0.5,   0.5,   0.5],
-            [0.5,  -0.5,   0.5],
-            [0,     0,     1]
+            [1, 0, 0],
+            [0.5, 0.5, 0.5],
+            [0.5, -0.5, 0.5],
+            [0, 0, 1]
         ], dtype=x.dtype, device=x.device)
 
-        # A.T @ m @ A
         At = torch.tensor([
-            [1,  1,  1,  0],
-            [0,  1, -1, -1]
+            [1, 1, 1, 0],
+            [0, 1, -1, -1]
         ], dtype=x.dtype, device=x.device)
 
-        # Transform the 3x3 kernel into the Winograd domain
-        GgG = torch.einsum('ij,oick->ojck', G, self.weight)
-        GgG = torch.einsum('ojck,kl->ojcl', GgG, G.T)  # Shape: [out, in, 4, 4]
+        # Step 4: Transform the kernel
+        Gg = torch.einsum('ij,oick->ojck', G, self.weight)
+        GgG = torch.einsum('ojck,kl->ojcl', Gg, G.T)  # (out, in, 4, 4)
 
-        # Transform input tiles
-        Bt_d_B = torch.einsum('ij,bcnhwjk->bcnhwik', Bt, tiles)
-        Bt_d_B = torch.einsum('bcnhwik,kl->bcnhwil', Bt_d_B, Bt.T)
+        # Step 5: Transform input tiles
+        V = torch.einsum('ij,bcnhwjk->bcnhwik', Bt, tiles)       # B C nH nW 4 4
+        V = torch.einsum('bcnhwik,kl->bcnhwil', V, Bt.T)
 
-        # Element-wise multiplication (broadcasted over channels)
-        U = GgG.unsqueeze(0).unsqueeze(0)  # shape: [1,1,out,in,4,4]
-        V = Bt_d_B.unsqueeze(2)            # shape: [B,C,nH,nW,1,4,4]
+        # Step 6: Element-wise multiply in Winograd domain
+        # Align dimensions: [B, C, nH, nW, 4, 4] @ [1, C, out, 4, 4]
+        U = GgG.unsqueeze(0).transpose(1, 2)  # (1, out, in, 4, 4)
+        M = torch.einsum('bcnhij,iojkl->bconhlk', V, U)  # Result shape: B, out, nH, nW, 4, 4
 
-        M = (U * V).sum(dim=3)  # Reduce over input channels → [B, C_out, nH, nW, 4, 4]
+        # Step 7: Inverse transform output
+        Y = torch.einsum('ij,bconhjk->bconhik', At, M)
+        Y = torch.einsum('bconhik,kl->bconhil', Y, At.T)
 
-        # Inverse transform: At @ m @ A
-        Y = torch.einsum('ij,bcnhjk->bcnhik', At, M)
-        Y = torch.einsum('bcnhik,kl->bcnhil', Y, At.T)
+        # Step 8: Extract only the 2x2 output per tile
+        Y = Y[:, :, :, :, :2, :2]  # (B, out, nH, nW, 2, 2)
 
-        # Crop to get 2x2 output from each tile
-        Y = Y[:, :, :, :, :2, :2]  # [B, out, nH, nW, 2, 2]
-        Y = Y.contiguous().view(B, self.out_channels, H, W)  # Stitch tiles back
+        # Step 9: Stitch tiles back into full image
+        nH, nW = Y.shape[2], Y.shape[3]
+        Y = Y.permute(0, 1, 2, 4, 3, 5).contiguous()  # B, out, nH, 2, nW, 2
+        Y = Y.view(B, self.out_channels, nH * 2, nW * 2)
 
+        # Step 10: Crop extra padding if any
+        Y = Y[:, :, :H, :W]
+
+        # Step 11: Add bias
         if self.bias is not None:
             Y += self.bias.view(1, -1, 1, 1)
 
         return Y
+
 
     def fuseforward(self, x):
         return self.forward(x)
