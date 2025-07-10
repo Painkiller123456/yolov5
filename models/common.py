@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from PIL import Image
 from torch.cuda import amp
 
@@ -70,6 +71,94 @@ def autopad(k, p=None, d=1):
     return p
 
 
+
+class WinogradConv2D(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
+        super(WinogradConv2D, self).__init__()
+
+        assert kernel_size == 3, "Only 3x3 Winograd supported"
+        assert stride == 1, "Stride must be 1 for Winograd"
+
+        # Required for YOLOv5 layer fusion and tracing
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = (3, 3)
+        self.stride = (1, 1)
+        self.padding = (1, 1)
+        self.dilation = (1, 1)
+        self.groups = 1
+
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
+        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        assert C == self.in_channels, "Input channel mismatch"
+
+        # Pad to ensure divisibility by 2
+        if H % 2 != 0 or W % 2 != 0:
+            x = F.pad(x, (0, W % 2, 0, H % 2))  # pad right, bottom
+
+        # Extract 4x4 tiles (Winograd F(2x2,3x3) needs 4x4 region for 2x2 output)
+        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # shape: (B, C, nH, nW, 4, 4)
+
+        # Transform matrices from Lavin's paper (Winograd minimal filtering)
+        # B.T @ d @ B
+        Bt = torch.tensor([
+            [1,  0, -1,  0],
+            [0,  1,  1,  0],
+            [0, -1,  1,  0],
+            [0,  1,  0, -1]
+        ], dtype=x.dtype, device=x.device)
+
+        # G @ g @ G.T
+        G = torch.tensor([
+            [1,     0,     0],
+            [0.5,   0.5,   0.5],
+            [0.5,  -0.5,   0.5],
+            [0,     0,     1]
+        ], dtype=x.dtype, device=x.device)
+
+        # A.T @ m @ A
+        At = torch.tensor([
+            [1,  1,  1,  0],
+            [0,  1, -1, -1]
+        ], dtype=x.dtype, device=x.device)
+
+        # Transform the 3x3 kernel into the Winograd domain
+        GgG = torch.einsum('ij,oick->ojck', G, self.weight)
+        GgG = torch.einsum('ojck,kl->ojcl', GgG, G.T)  # Shape: [out, in, 4, 4]
+
+        # Transform input tiles
+        Bt_d_B = torch.einsum('ij,bcnhwjk->bcnhwik', Bt, tiles)
+        Bt_d_B = torch.einsum('bcnhwik,kl->bcnhwil', Bt_d_B, Bt.T)
+
+        # Element-wise multiplication (broadcasted over channels)
+        U = GgG.unsqueeze(0).unsqueeze(0)  # shape: [1,1,out,in,4,4]
+        V = Bt_d_B.unsqueeze(2)            # shape: [B,C,nH,nW,1,4,4]
+
+        M = (U * V).sum(dim=3)  # Reduce over input channels → [B, C_out, nH, nW, 4, 4]
+
+        # Inverse transform: At @ m @ A
+        Y = torch.einsum('ij,bcnhjk->bcnhik', At, M)
+        Y = torch.einsum('bcnhik,kl->bcnhil', Y, At.T)
+
+        # Crop to get 2x2 output from each tile
+        Y = Y[:, :, :, :, :2, :2]  # [B, out, nH, nW, 2, 2]
+        Y = Y.contiguous().view(B, self.out_channels, H, W)  # Stitch tiles back
+
+        if self.bias is not None:
+            Y += self.bias.view(1, -1, 1, 1)
+
+        return Y
+
+    def fuseforward(self, x):
+        return self.forward(x)
+
+    def fuse(self):
+        return self
+
+
 class Conv(nn.Module):
     """Applies a convolution, batch normalization, and activation function to an input tensor in a neural network."""
 
@@ -78,7 +167,10 @@ class Conv(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         """Initializes a standard convolution layer with optional batch normalization and activation."""
         super().__init__()
-        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+         if k == 3 and g == 1:  # Use Winograd for 3x3 conv only
+            self.conv = WinogradConv2D(c1, c2, kernel_size=k, stride=s, padding=autopad(k, p), bias=False)
+        else:
+            self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
