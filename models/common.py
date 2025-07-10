@@ -138,12 +138,13 @@ class WinogradConv2D(nn.Module):
 
         # Step 6: Elementwise multiplication in Winograd domain
         # V: [B, C_in, nH, nW, 4, 4], U: [out, C_in, 4, 4]
-        M = torch.einsum('bcnhij,ocij->bonh', V, U)  # [B, out, nH, nW]
+        M = torch.einsum('bcnhij,ocij->bonhij', V, U)
+         # [B, out, nH, nW]
 
         # Step 7: Transform back to spatial domain (inverse)
-        M = M.view(B, self.out_channels, nH, nW, 4, 4)
-        Y = torch.einsum('ij,bcnhjk->bcnhik', At, M)
-        Y = torch.einsum('bcnhik,kl->bcnhil', Y, At.T)  # [B, out, nH, nW, 2, 2]
+        
+        Y = torch.einsum('ij,bonhjk->bonhik', At, M)
+        Y = torch.einsum('bonhik,kl->bonhil', Y, At.T)  # [B, out, nH, nW, 2, 2]
 
         # Step 8: Reconstruct full image
         Y = Y[:, :, :, :, :2, :2]  # ensure only 2x2 output
