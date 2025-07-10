@@ -167,7 +167,7 @@ class Conv(nn.Module):
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         """Initializes a standard convolution layer with optional batch normalization and activation."""
         super().__init__()
-         if k == 3 and g == 1:  # Use Winograd for 3x3 conv only
+        if k == 3 and g == 1:  # Use Winograd for 3x3 conv only
             self.conv = WinogradConv2D(c1, c2, kernel_size=k, stride=s, padding=autopad(k, p), bias=False)
         else:
             self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
