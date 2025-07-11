@@ -71,107 +71,100 @@ def autopad(k, p=None, d=1):
     return p
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
 class WinogradConv2D(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
-        super(WinogradConv2D, self).__init__()
-        assert kernel_size == 3, "Only 3x3 supported for Winograd"
-        assert stride == 1, "Stride must be 1 for Winograd"
-        self.in_channels = in_channels
+    """
+    Implements F(2×2, 3×3) Winograd convolution:
+      - Input tiles are 4×4 → output tiles are 2×2.
+      - Reduces multiplication count from 9 → 4 per tile.
+    """
+
+    def _init_(self, in_channels, out_channels, bias=True):
+        super()._init_()
+        # only 3×3 kernels and stride=1 supported
+        self.in_channels  = in_channels
         self.out_channels = out_channels
-        self.kernel_size = (3, 3)
-        self.stride = (1, 1)
-        self.padding = (1, 1)
-        self.dilation = (1, 1)
-        self.groups = 1
+
+        # learnable 3×3 weight and optional bias
         self.weight = nn.Parameter(torch.randn(out_channels, in_channels, 3, 3))
-        self.bias = nn.Parameter(torch.zeros(out_channels)) if bias else None
-        
+        self.bias   = nn.Parameter(torch.zeros(out_channels)) if bias else None
+
+        # Winograd transform matrices for F(2,3)
+        Bt = torch.tensor([
+            [ 1,  0, -1,  0],
+            [ 0,  1,  1,  0],
+            [ 0, -1,  1,  0],
+            [ 0,  1,  0, -1]
+        ], dtype=torch.float32)
+        G  = torch.tensor([
+            [1,     0,    0],
+            [0.5,  0.5,  0.5],
+            [0.5, -0.5,  0.5],
+            [0,     0,    1]
+        ], dtype=torch.float32)
+        At = torch.tensor([
+            [1,  1,  1,  0],
+            [0,  1, -1, -1]
+        ], dtype=torch.float32)
+
+        # register as buffers so they'll move with the module (CPU ↔ GPU)
+        self.register_buffer('Bt', Bt)
+        self.register_buffer('G',  G)
+        self.register_buffer('At', At)
+
     def forward(self, x):
         B, C_in, H, W = x.shape
-        assert C_in == self.in_channels, "Input channel mismatch"
-        
-        # Step 1: Pad input to make H, W divisible by 2
-        pad_h = (2 - H % 2) % 2
-        pad_w = (2 - W % 2) % 2
-        x = F.pad(x, (0, pad_w, 0, pad_h))  # right, bottom
-        H_padded, W_padded = x.shape[2:]
-        
-        # Step 2: Extract 4x4 tiles (F(2x2,3x3) needs 4x4)
-        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)  # [B, C, nH, nW, 4, 4]
+        assert C_in == self.in_channels, \
+            f"Expected {self.in_channels} input channels but got {C_in}"
+
+        # 1) Pad to make H,W multiples of 2 (tile size=2)
+        pad_h = (2 - (H % 2)) % 2
+        pad_w = (2 - (W % 2)) % 2
+        x = F.pad(x, (0, pad_w, 0, pad_h))  # (left, right, top, bottom)
+        H_p, W_p = x.shape[2:]
+
+        # 2) Extract 4×4 tiles with stride=2
+        #    resulting shape: [B, C, nH, nW, 4, 4]
+        tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)
+
         B, C_in, nH, nW, _, _ = tiles.shape
-        
-        # Step 3: Winograd transform matrices
-        Bt = torch.tensor([
-            [1, 0, -1, 0],
-            [0, 1, 1, 0],
-            [0, -1, 1, 0],
-            [0, 1, 0, -1]
-        ], dtype=x.dtype, device=x.device)
-        
-        G = torch.tensor([
-            [1, 0, 0],
-            [0.5, 0.5, 0.5],
-            [0.5, -0.5, 0.5],
-            [0, 0, 1]
-        ], dtype=x.dtype, device=x.device)
-        
-        At = torch.tensor([
-            [1, 1, 1, 0],
-            [0, 1, -1, -1]
-        ], dtype=x.dtype, device=x.device)
-        
-        # Step 4: Transform kernel to Winograd domain
-        # self.weight: [out_channels, in_channels, 3, 3]
-        Gg = torch.einsum('ij,oick->ojck', G, self.weight)
-        U = torch.einsum('ojck,kl->ojcl', Gg, G.T)  # [out_channels, in_channels, 4, 4]
-        
-        # Step 5: Transform input tiles
-        V = torch.einsum('ij,bcnhwjk->bcnhwik', Bt, tiles)  # (B, C, nH, nW, 4, 4)
-        V = torch.einsum('bcnhwik,kl->bcnhwil', V, Bt.T)    # (B, C, nH, nW, 4, 4)
-        
-        # Step 6: Elementwise multiplication in Winograd domain
-        # V: [B, C_in, nH, nW, 4, 4], U: [out_channels, C_in, 4, 4]
-        # Need to handle this multiplication properly for each spatial element
-        V_reshaped = V.view(B, C_in, nH * nW, 4, 4)  # [B, C_in, nH*nW, 4, 4]
-        U_reshaped = U.view(self.out_channels, C_in, 4, 4)  # [out_channels, C_in, 4, 4]
-        
-        # Perform convolution in Winograd domain
-        M = torch.zeros(B, self.out_channels, nH * nW, 4, 4, device=x.device, dtype=x.dtype)
-        for i in range(32):
-            for j in range(4):
-                # Element-wise multiplication and sum over input channels
-                M[:, :, :, i, j] = torch.einsum('bct,oct->bot', V_reshaped[:, :, :, i, j], U_reshaped[:, :, i, j])
-        
-        M = M.view(B, self.out_channels, nH, nW, 4, 4)  # [B, out_channels, nH, nW, 4, 4]
-        
-        # Step 7: Transform back to spatial domain (inverse)
-        Y = torch.einsum('ij,bonhjk->bonhik', At, M)
-        Y = torch.einsum('bonhik,kl->bonhil', Y, At.T)  # [B, out, nH, nW, 2, 2]
-        
-        # Step 8: Reconstruct full image
-        Y = Y[:, :, :, :, :2, :2]  # ensure only 2x2 output
-        Y = Y.permute(0, 1, 2, 4, 3, 5).contiguous()
-        Y = Y.view(B, self.out_channels, nH * 2, nW * 2)  # [B, out, H, W]
-        
-        # Step 9: Crop back to original input size
+
+        # 3) Transform kernel: U[o,c,i,j] = ∑ₚₑ G[i,p]·W[o,c,p,q]·G[j,q]
+        #    tmp1[p→i], then tmp2[q→j]
+        tmp1 = torch.einsum('ip,ocpq->ociq', self.G, self.weight)  # [O, C, 4, 3]
+        U    = torch.einsum('jq,ociq->ocij', self.G, tmp1)         # [O, C, 4, 4]
+
+        # 4) Transform input tiles: V[b,c,h,w,i,j] = ∑ᵣₛ Bt[i,r]·tiles[b,c,h,w,r,s]·Bt[j,s]
+        tmp2 = torch.einsum('ij,bcnhjk->bcnhik', self.Bt,   tiles)  # [B, C, nH, nW, 4, 4]
+        V    = torch.einsum('kl,bcnhik->bcnhil', self.Bt.T, tmp2)    # [B, C, nH, nW, 4, 4]
+
+        # 5) Elementwise multiplication & sum over input channels
+        #    V: [B,   C, nH, nW, 4, 4]
+        #    U: [O,   C,   4,   4]
+        V_exp = V.unsqueeze(1)                                 # [B, 1, C, nH, nW, 4, 4]
+        U_exp = U.view(1, self.out_channels, C_in, 1, 1, 4, 4)  # [1, O, C, 1, 1, 4, 4]
+        M = (V_exp * U_exp).sum(2)                             # [B, O, nH, nW, 4, 4]
+
+        # 6) Inverse Winograd transform: Yt[b,o,h,w,r,s] = ∑ᵢⱼ At[r,i]·M[b,o,h,w,i,j]·At[s,j]
+        tmp3 = torch.einsum('ri,bohnij->borhnj', self.At,    M)     # [B, O, nH, nW, 2, 4]
+        Yt   = torch.einsum('sj,borhnj->borths',   self.At.T, tmp3) # [B, O, nH, nW, 2, 2]
+
+        # 7) Rearrange tiles back into image
+        #    currently [B, O, nH, nW, 2, 2] → [B, O, nH*2, nW*2]
+        Y = Yt.permute(0, 1, 2, 4, 3, 5).contiguous() \
+              .view(B, self.out_channels, nH*2, nW*2)
+
+        # 8) Crop to original size and add bias
         Y = Y[:, :, :H, :W]
-        
-        # Step 10: Add bias
         if self.bias is not None:
-            Y += self.bias.view(1, -1, 1, 1)
-            
+            Y = Y + self.bias.view(1, -1, 1, 1)
+
         return Y
-    
+
     def fuseforward(self, x):
         return self.forward(x)
-    
+
     def fuse(self):
         return self
-
 
 
 class Conv(nn.Module):
