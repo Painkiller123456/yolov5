@@ -157,7 +157,7 @@ class WinogradConv2D(nn.Module):
 
         # 6) inverse Winograd: Yt[b,o,h,w,r,s] = Σᵢⱼ At[r,i]·M[b,o,h,w,i,j]·At[s,j]
         t3 = torch.einsum('ri,bohnij->borhnj',    self.At,    M)   # [B,O,nH,nW,2,4]
-        Yt = torch.einsum('sj,borhnj->borths',    self.At.T, t3)   # [B,O,nH,nW,2,2]
+        Yt = torch.einsum('sj,borhnj->borhns',    self.At.T, t3)   # [B,O,nH,nW,2,2]
 
         # 7) re-assemble tiles → [B,O,nH*2,nW*2]
         Y = Yt.permute(0,1,2,4,3,5).contiguous() \
