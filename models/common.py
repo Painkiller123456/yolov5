@@ -181,7 +181,7 @@ class Conv(nn.Module):
         if k == 3 and s == 1 and g == 1:
             self.conv = WinogradConv2D(c1, c2, kernel_size=k, stride=s, padding=autopad(k, p), bias=False)
         else:
-            self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
+            self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p), groups=g, bias=False)
         self.bn = nn.BatchNorm2d(c2)
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
