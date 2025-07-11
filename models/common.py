@@ -70,9 +70,6 @@ def autopad(k, p=None, d=1):
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class WinogradConv2D(nn.Module):
     """
