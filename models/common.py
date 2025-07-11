@@ -161,7 +161,7 @@ class WinogradConv2D(nn.Module):
              .view(B, self.out_channels, nH*2, nW*2)
 
         # 8) crop to original spatial dims and add bias
-        Y = Y[:, :, :H, :W]
+        Y = Y[:, :, self.padding:self.padding+H, self.padding:self.padding+W]
         if self.bias is not None:
             Y = Y + self.bias.view(1, -1, 1, 1)
 
