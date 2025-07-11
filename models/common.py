@@ -85,7 +85,7 @@ class WinogradConv2D(nn.Module):
                  stride=1,
                  padding=1,
                  bias=True):
-        super()._init_()
+        super().__init__()
         # only support 3×3 / stride=1 / no groups
         assert kernel_size == 3, "WinogradConv2D: kernel_size must be 3"
         assert stride == 1,      "WinogradConv2D: stride must be 1"
