@@ -141,7 +141,7 @@ class WinogradConv2D(nn.Module):
         
         # Perform convolution in Winograd domain
         M = torch.zeros(B, self.out_channels, nH * nW, 4, 4, device=x.device, dtype=x.dtype)
-        for i in range(4):
+        for i in range(32):
             for j in range(4):
                 # Element-wise multiplication and sum over input channels
                 M[:, :, :, i, j] = torch.einsum('bct,oct->bot', V_reshaped[:, :, :, i, j], U_reshaped[:, :, i, j])
