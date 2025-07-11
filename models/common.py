@@ -180,6 +180,7 @@ class WinogradConv2D(nn.Module):
         if self.bias is not None:
             Y = Y + self.bias.view(1, -1, 1, 1)
 
+        return Y
 
     def fuseforward(self, x):
         return self.forward(x)
