@@ -172,10 +172,14 @@ class WinogradConv2D(nn.Module):
 
         # 8) crop to original spatial dims and add bias
         Y = Y[:, :, self.padding:self.padding+H, self.padding:self.padding+W]
+
+        # If output shape mismatches input (due to extra padding), crop again
+        if Y.shape[2] != H or Y.shape[3] != W:
+            Y = Y[:, :, :H, :W]
+
         if self.bias is not None:
             Y = Y + self.bias.view(1, -1, 1, 1)
 
-        return Y
 
     def fuseforward(self, x):
         return self.forward(x)
