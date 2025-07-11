@@ -127,11 +127,21 @@ class WinogradConv2D(nn.Module):
         B, C, H, W = x.shape
         assert C == self.in_channels
 
-        # 1) pad so H,W ≡ 0 mod 2 after standard conv-padding*
+        # 1) pad with standard conv padding first
         x = F.pad(x,
                   (self.padding, self.padding,
                    self.padding, self.padding))
         H_p, W_p = x.shape[2:]
+
+        # 1.1) ensure H_p and W_p are divisible by 2 (Winograd requires even dims)
+        extra_h = H_p % 2
+        extra_w = W_p % 2
+        if extra_h != 0 or extra_w != 0:
+            x = F.pad(x, (0, extra_w, 0, extra_h))  # pad right and bottom as needed
+
+        # update padded sizes after potential extra pad
+        H_p, W_p = x.shape[2:]
+
 
         # 2) make 4×4 tiles with stride=2 → shape [B, C, nH, nW, 4, 4]
         tiles = x.unfold(2, 4, 2).unfold(3, 4, 2)
