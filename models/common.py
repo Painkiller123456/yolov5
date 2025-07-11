@@ -71,6 +71,10 @@ def autopad(k, p=None, d=1):
     return p
 
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 class WinogradConv2D(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=True):
         super(WinogradConv2D, self).__init__()
@@ -131,9 +135,18 @@ class WinogradConv2D(nn.Module):
         
         # Step 6: Elementwise multiplication in Winograd domain
         # V: [B, C_in, nH, nW, 4, 4], U: [out_channels, C_in, 4, 4]
-        # Fix: Need to contract over the channel dimension properly
-        M = torch.einsum('bcnhij,ocij->bonhij', V, U)  # [B, out_channels, nH, nW, 4, 4]
-        M = M.sum(dim=1)  # Sum over input channels -> [B, out_channels, nH, nW, 4, 4]
+        # Need to handle this multiplication properly for each spatial element
+        V_reshaped = V.view(B, C_in, nH * nW, 4, 4)  # [B, C_in, nH*nW, 4, 4]
+        U_reshaped = U.view(self.out_channels, C_in, 4, 4)  # [out_channels, C_in, 4, 4]
+        
+        # Perform convolution in Winograd domain
+        M = torch.zeros(B, self.out_channels, nH * nW, 4, 4, device=x.device, dtype=x.dtype)
+        for i in range(4):
+            for j in range(4):
+                # Element-wise multiplication and sum over input channels
+                M[:, :, :, i, j] = torch.einsum('bct,oct->bot', V_reshaped[:, :, :, i, j], U_reshaped[:, :, i, j])
+        
+        M = M.view(B, self.out_channels, nH, nW, 4, 4)  # [B, out_channels, nH, nW, 4, 4]
         
         # Step 7: Transform back to spatial domain (inverse)
         Y = torch.einsum('ij,bonhjk->bonhik', At, M)
