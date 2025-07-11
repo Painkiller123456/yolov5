@@ -78,7 +78,7 @@ class WinogradConv2D(nn.Module):
       - Internally only supports k=3, s=1, groups=1.
       - Transforms 4×4 input tiles → 2×2 output tiles.
     """
-    def _init_(self,
+    def __init__(self,
                  in_channels,
                  out_channels,
                  kernel_size=3,
