@@ -133,6 +133,7 @@ class WinogradConv2D(nn.Module):
                    self.padding, self.padding))
         H_p, W_p = x.shape[2:]
 
+        H_out, W_out = H, W
         # 1.1) ensure H_p and W_p are divisible by 2 (Winograd requires even dims)
         extra_h = H_p % 2
         extra_w = W_p % 2
@@ -171,14 +172,11 @@ class WinogradConv2D(nn.Module):
              .view(B, self.out_channels, nH*2, nW*2)
 
         # 8) crop to original spatial dims and add bias
-        Y = Y[:, :, self.padding:self.padding+H, self.padding:self.padding+W]
-
-        # If output shape mismatches input (due to extra padding), crop again
-        if Y.shape[2] != H or Y.shape[3] != W:
-            Y = Y[:, :, :H, :W]
+        Y = Y[:, :, :H, :W]  # Directly crop to match input H, W
 
         if self.bias is not None:
             Y = Y + self.bias.view(1, -1, 1, 1)
+
 
         return Y
 
