@@ -93,6 +93,8 @@ class WinogradConv2D(nn.Module):
         self.in_channels  = in_channels
         self.out_channels = out_channels
         self.padding      = padding
+        self.kernel_size  = (3, 3)
+        self.stride       = (1, 1)
 
         # learnable weight & bias
         self.weight = nn.Parameter(torch.randn(out_channels,
